@@ -57,7 +57,7 @@ function normalise(j) {
 
 /* ── Sync from RapidAPI → upsert into MongoDB ──────────────────────────────── */
 async function syncFromAPI() {
-  const response = await fetch("https://internships-api.p.rapidapi.com/active-jb-7d", {
+  const response = await fetch("https://internships-api.p.rapidapi.com/active-jb-7d?country=IN", {
     method: "GET",
     headers: {
       "x-rapidapi-key":  process.env.RAPIDAPI_KEY,
@@ -115,7 +115,13 @@ router.get("/", async (req, res) => {
   }
 
   try {
-    const query = {};
+    const query = {
+      // Only show India-based listings
+      $or: [
+        { location: { $regex: "india|IN$|mumbai|delhi|bangalore|bengaluru|hyderabad|pune|chennai|kolkata|noida|gurgaon|gurugram|ahmedabad|jaipur|remote", $options: "i" } },
+        { location: "" },  // include listings with no location set
+      ],
+    };
 
     if (search?.trim()) {
       query.$or = [
