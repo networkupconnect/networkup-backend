@@ -33,6 +33,9 @@ import proxyRouter from "./routes/proxy.js";
 import connectionRoutes from "./routes/connection.routes.js";
 import projectRoutes from "./routes/project.routes.js";
 import targetsRouter from "./routes/targets.routes.js"
+import jobsRouter from "./routes/internships.routes.js";
+
+
 
 const app = express();
 
@@ -80,6 +83,7 @@ app.use("/api/confessions", confessionRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api", proxyRouter);
 app.use("/api/targets", targetsRouter);
+app.use("/api/internships", jobsRouter);
 app.get("/", (req, res) => res.send("Backend running 🚀"));
 
 // ── Socket.IO ─────────────────────────────────────────────────────────────────
