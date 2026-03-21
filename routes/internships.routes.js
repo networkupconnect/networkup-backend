@@ -47,8 +47,10 @@ async function syncFromAPI() {
     throw new Error(`API_ERROR_${response.status}`);
   }
 
-  const raw = await response.json();
-  const list = Array.isArray(raw) ? raw : (raw.data || raw.jobs || []);
+const raw = await response.json();
+console.log("RAW:", JSON.stringify(raw).slice(0, 500)); // ← add
+const list = Array.isArray(raw) ? raw : (raw.data || raw.jobs || []);
+console.log("LIST LENGTH:", list.length); // ← add  const list = Array.isArray(raw) ? raw : (raw.data || raw.jobs || []);
 
   if (!list.length) return 0;
 
