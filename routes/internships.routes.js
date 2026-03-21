@@ -4,61 +4,57 @@ import Internship from "../models/Internships.js";
 const router = express.Router();
 
 let lastApiFetch = 0;
-const FETCH_INTERVAL = 6 * 60 * 60 * 1000;
+const FETCH_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
 
-/* ── Normalise raw API job → our schema ─────────────────────────────────────
-   Actual field names from internships-api.p.rapidapi.com/active-jb-7d:
-   id, title, organization, organization_url, date_posted, date_created,
-   locations_raw[{address:{addressLocality, addressRegion, addressCountry}}],
-   employment_type, url (apply link), description, linkedin_org_logo_url
-────────────────────────────────────────────────────────────────────────────── */
-function normalise(j) {
-  // Extract location from locations_raw array
+/* ── Type prettifier ────────────────────────────────────────────────────────── */
+const TYPE_MAP = {
+  FULL_TIME:"Full-time", FULLTIME:"Full-time",
+  PART_TIME:"Part-time", PARTTIME:"Part-time",
+  INTERN:"Internship", INTERNSHIP:"Internship",
+  CONTRACT:"Contract", CONTRACTOR:"Contract",
+  TEMPORARY:"Temporary",
+};
+function prettifyType(raw) {
+  if (!raw) return "";
+  const arr = Array.isArray(raw) ? raw : [raw];
+  const str = arr.join(", ");
+  return TYPE_MAP[str.toUpperCase().replace(/[- ]/g,"")] || str;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   SOURCE 1 — RapidAPI Internships
+══════════════════════════════════════════════════════════════════════════════ */
+function normaliseRapid(j) {
   let location = "";
   if (j.locations_raw?.length) {
     const addr = j.locations_raw[0]?.address || {};
-    const parts = [addr.addressLocality, addr.addressRegion, addr.addressCountry].filter(Boolean);
-    location = parts.join(", ");
+    location = [addr.addressLocality, addr.addressRegion, addr.addressCountry].filter(Boolean).join(", ");
   }
-  location = location || j.location || j.job_location || "";
+  location = location || j.location || "";
 
-  // employment_type can be an array ["FULL_TIME"] or a string
-  const empTypeRaw = Array.isArray(j.employment_type)
-    ? j.employment_type.join(", ")
-    : (j.employment_type || j.type || j.job_type || "");
-
-  // Prettify type: "FULL_TIME" → "Full-time", "INTERN" → "Internship"
-  const typeMap = { FULL_TIME:"Full-time", PART_TIME:"Part-time", INTERN:"Internship", INTERNSHIP:"Internship", CONTRACT:"Contract", TEMPORARY:"Temporary" };
-  const type = typeMap[empTypeRaw.toUpperCase()] || empTypeRaw;
-
-  // Remote detection
-  const isRemote = !!(
-    j.remote ||
-    j.is_remote ||
-    location.toLowerCase().includes("remote") ||
-    empTypeRaw.toLowerCase().includes("remote")
-  );
+  const type     = prettifyType(j.employment_type || j.type || "");
+  const isRemote = !!(j.remote || j.is_remote || location.toLowerCase().includes("remote"));
 
   return {
-    externalId:  String(j.id || j._id || `${j.title}-${j.organization}`),
-    title:       j.title             || "",
-    company:     j.organization      || j.company || j.employer_name || "",
+    externalId:  `rapid_${j.id || `${j.title}-${j.organization}`}`,
+    title:       j.title || "",
+    company:     j.organization || j.company || "",
     location,
     type,
-    url:         j.url               || j.apply_url || j.job_url || j.link || "",
-    description: (j.description      || j.job_description || "").replace(/<[^>]+>/g, "").slice(0, 800),
-    logo:        j.linkedin_org_logo_url || j.company_logo || j.logo || "",
+    url:         j.url || j.apply_url || "",
+    description: (j.description || "").replace(/<[^>]+>/g, "").slice(0, 800),
+    logo:        j.linkedin_org_logo_url || j.logo || "",
     remote:      isRemote,
-    source:      j.source            || "LinkedIn",
-    postedAt:    j.date_posted       || j.posted_at || null,
+    source:      "LinkedIn",
+    postedAt:    j.date_posted || null,
     fetchedAt:   new Date(),
   };
 }
 
-/* ── Sync from RapidAPI → upsert into MongoDB ──────────────────────────────── */
-async function syncFromAPI() {
-  const response = await fetch("https://internships-api.p.rapidapi.com/active-jb-7d?country=IN", {
-    method: "GET",
+async function syncRapidAPI() {
+  if (!process.env.RAPIDAPI_KEY) return 0;
+
+  const res = await fetch("https://internships-api.p.rapidapi.com/active-jb-7d?country=IN", {
     headers: {
       "x-rapidapi-key":  process.env.RAPIDAPI_KEY,
       "x-rapidapi-host": "internships-api.p.rapidapi.com",
@@ -66,69 +62,153 @@ async function syncFromAPI() {
     },
   });
 
-  if (response.status === 429) throw new Error("RATE_LIMITED");
-  if (!response.ok)            throw new Error(`API_ERROR_${response.status}`);
+  if (res.status === 429) { console.warn("RapidAPI: rate limited"); return 0; }
+  if (!res.ok) { console.warn(`RapidAPI: ${res.status}`); return 0; }
 
-  const raw  = await response.json();
+  const raw  = await res.json();
   const list = Array.isArray(raw) ? raw : (raw.data || raw.jobs || []);
-
   if (!list.length) return 0;
 
-  const ops = list.map(j => {
-    const doc = normalise(j);
-    return {
-      updateOne: {
-        filter: { externalId: doc.externalId },
-        update: { $set: doc },
-        upsert: true,
-      },
-    };
-  });
-
-  await Internship.bulkWrite(ops, { ordered: false });
-  lastApiFetch = Date.now();
+  await upsertMany(list.map(normaliseRapid));
   return list.length;
 }
 
-/* ── GET /api/internships ──────────────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════════
+   SOURCE 2 — SerpAPI Google Jobs (India-focused)
+   Searches multiple queries to get more coverage:
+     "internship India", "software intern India", "engineering intern India"
+══════════════════════════════════════════════════════════════════════════════ */
+function normaliseSerp(j) {
+  const loc = j.location || j.detected_extensions?.location || "";
+  const isRemote = !!(loc.toLowerCase().includes("remote") || j.detected_extensions?.work_from_home);
+
+  // Google Jobs apply link — prefer direct link over Google's redirect
+  const url = j.apply_options?.[0]?.link || j.related_links?.[0]?.link || j.job_link || "";
+
+  return {
+    externalId:  `serp_${j.job_id || `${j.title}-${j.company_name}`}`,
+    title:       j.title        || "",
+    company:     j.company_name || "",
+    location:    loc,
+    type:        j.detected_extensions?.schedule_type || "",
+    url,
+    description: (j.description || "").replace(/<[^>]+>/g, "").slice(0, 800),
+    logo:        j.thumbnail    || "",
+    remote:      isRemote,
+    source:      "Google Jobs",
+    postedAt:    j.detected_extensions?.posted_at
+                   ? new Date(j.detected_extensions.posted_at)
+                   : null,
+    fetchedAt:   new Date(),
+  };
+}
+
+async function syncSerpAPI() {
+  if (!process.env.SERP_API_KEY) return 0;
+
+  const queries = [
+    "internship India",
+    "software intern India",
+    "engineering intern India",
+    "tech intern Bangalore Mumbai Delhi",
+  ];
+
+  let total = 0;
+
+  for (const q of queries) {
+    try {
+      const params = new URLSearchParams({
+        engine:    "google_jobs",
+        q,
+        hl:        "en",
+        gl:        "in",       // country = India
+        api_key:   process.env.SERP_API_KEY,
+      });
+
+      const res = await fetch(`https://serpapi.com/search?${params}`);
+      if (!res.ok) { console.warn(`SerpAPI ${q}: ${res.status}`); continue; }
+
+      const data = await res.json();
+      const jobs = data.jobs_results || [];
+      if (!jobs.length) continue;
+
+      await upsertMany(jobs.map(normaliseSerp));
+      total += jobs.length;
+
+      // Small delay between queries to be polite to the API
+      await new Promise(r => setTimeout(r, 300));
+    } catch (err) {
+      console.warn(`SerpAPI query "${q}" failed:`, err.message);
+    }
+  }
+
+  return total;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   SHARED — Upsert helper + sync orchestrator
+══════════════════════════════════════════════════════════════════════════════ */
+async function upsertMany(docs) {
+  if (!docs.length) return;
+  const ops = docs.map(doc => ({
+    updateOne: {
+      filter: { externalId: doc.externalId },
+      update: { $set: doc },
+      upsert: true,
+    },
+  }));
+  await Internship.bulkWrite(ops, { ordered: false });
+}
+
+async function syncAll() {
+  const [r, s] = await Promise.allSettled([syncRapidAPI(), syncSerpAPI()]);
+  const rapidCount = r.status === "fulfilled" ? r.value : 0;
+  const serpCount  = s.status === "fulfilled" ? s.value : 0;
+  console.log(`Internships synced — RapidAPI: ${rapidCount}, SerpAPI: ${serpCount}`);
+  lastApiFetch = Date.now();
+  return rapidCount + serpCount;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   GET /api/internships
+══════════════════════════════════════════════════════════════════════════════ */
 router.get("/", async (req, res) => {
   const { search = "", type = "", refresh = "" } = req.query;
   const now = Date.now();
 
-  let synced = false, rateLimited = false, apiError = null;
+  let synced = false, apiError = null;
   const shouldFetch = refresh === "1" || now - lastApiFetch > FETCH_INTERVAL;
 
   if (shouldFetch) {
     try {
-      const count = await syncFromAPI();
+      await syncAll();
       synced = true;
-      console.log(`Internships synced: ${count} saved to MongoDB`);
     } catch (err) {
-      if (err.message === "RATE_LIMITED") {
-        rateLimited = true;
-        console.warn("Internships: rate limited — serving from MongoDB");
-      } else {
-        apiError = err.message;
-        console.error("Internships API error:", err.message);
-      }
+      apiError = err.message;
+      console.error("Internships syncAll error:", err.message);
     }
   }
 
   try {
+    // Base filter — India only
+    const indiaRegex = /india|mumbai|delhi|bangalore|bengaluru|hyderabad|pune|chennai|kolkata|noida|gurgaon|gurugram|ahmedabad|jaipur|surat|kochi|trivandrum|remote/i;
+
     const query = {
-      // Only show India-based listings
       $or: [
-        { location: { $regex: "india|IN$|mumbai|delhi|bangalore|bengaluru|hyderabad|pune|chennai|kolkata|noida|gurgaon|gurugram|ahmedabad|jaipur|remote", $options: "i" } },
-        { location: "" },  // include listings with no location set
+        { location: { $regex: indiaRegex.source, $options: "i" } },
+        { location: "" },
+        { source:   "Google Jobs" }, // SerpAPI already fetched with gl=in
       ],
     };
 
     if (search?.trim()) {
-      query.$or = [
-        { title:   { $regex: search, $options: "i" } },
-        { company: { $regex: search, $options: "i" } },
-        { location:{ $regex: search, $options: "i" } },
-      ];
+      query.$and = [{
+        $or: [
+          { title:    { $regex: search, $options: "i" } },
+          { company:  { $regex: search, $options: "i" } },
+          { location: { $regex: search, $options: "i" } },
+        ],
+      }];
     }
 
     if (type?.trim() && type !== "All") {
@@ -141,16 +221,15 @@ router.get("/", async (req, res) => {
 
     const listings = await Internship.find(query)
       .sort({ postedAt: -1, fetchedAt: -1 })
-      .limit(200)
+      .limit(300)
       .lean();
 
     return res.json({
-      data:       listings,
-      total:      listings.length,
+      data:      listings,
+      total:     listings.length,
       synced,
-      rateLimited,
       apiError,
-      fetchedAt:  lastApiFetch || null,
+      fetchedAt: lastApiFetch || null,
     });
 
   } catch (dbErr) {
