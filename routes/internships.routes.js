@@ -22,20 +22,29 @@ function normalise(j) {
   }
   location = location || j.location || j.job_location || "";
 
+  // employment_type can be an array ["FULL_TIME"] or a string
+  const empTypeRaw = Array.isArray(j.employment_type)
+    ? j.employment_type.join(", ")
+    : (j.employment_type || j.type || j.job_type || "");
+
+  // Prettify type: "FULL_TIME" → "Full-time", "INTERN" → "Internship"
+  const typeMap = { FULL_TIME:"Full-time", PART_TIME:"Part-time", INTERN:"Internship", INTERNSHIP:"Internship", CONTRACT:"Contract", TEMPORARY:"Temporary" };
+  const type = typeMap[empTypeRaw.toUpperCase()] || empTypeRaw;
+
   // Remote detection
   const isRemote = !!(
     j.remote ||
     j.is_remote ||
     location.toLowerCase().includes("remote") ||
-    j.employment_type?.toLowerCase().includes("remote")
+    empTypeRaw.toLowerCase().includes("remote")
   );
 
   return {
     externalId:  String(j.id || j._id || `${j.title}-${j.organization}`),
     title:       j.title             || "",
     company:     j.organization      || j.company || j.employer_name || "",
-    location:    location,
-    type:        j.employment_type   || j.type || j.job_type || "",
+    location,
+    type,
     url:         j.url               || j.apply_url || j.job_url || j.link || "",
     description: (j.description      || j.job_description || "").replace(/<[^>]+>/g, "").slice(0, 800),
     logo:        j.linkedin_org_logo_url || j.company_logo || j.logo || "",
