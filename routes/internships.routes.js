@@ -3,32 +3,50 @@ import Internship from "../models/Internships.js";
 
 const router = express.Router();
 
-/* ── In-memory flag to avoid re-fetching within the same 6hr window ─────────
-   MongoDB is the persistent cache — this just prevents hammering the API
-   on every request within the same server session.
-────────────────────────────────────────────────────────────────────────────── */
 let lastApiFetch = 0;
-const FETCH_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
+const FETCH_INTERVAL = 6 * 60 * 60 * 1000;
 
-/* ── Normalise raw API job into our schema ────────────────────────────────── */
+/* ── Normalise raw API job → our schema ─────────────────────────────────────
+   Actual field names from internships-api.p.rapidapi.com/active-jb-7d:
+   id, title, organization, organization_url, date_posted, date_created,
+   locations_raw[{address:{addressLocality, addressRegion, addressCountry}}],
+   employment_type, url (apply link), description, linkedin_org_logo_url
+────────────────────────────────────────────────────────────────────────────── */
 function normalise(j) {
+  // Extract location from locations_raw array
+  let location = "";
+  if (j.locations_raw?.length) {
+    const addr = j.locations_raw[0]?.address || {};
+    const parts = [addr.addressLocality, addr.addressRegion, addr.addressCountry].filter(Boolean);
+    location = parts.join(", ");
+  }
+  location = location || j.location || j.job_location || "";
+
+  // Remote detection
+  const isRemote = !!(
+    j.remote ||
+    j.is_remote ||
+    location.toLowerCase().includes("remote") ||
+    j.employment_type?.toLowerCase().includes("remote")
+  );
+
   return {
-    externalId:  String(j.id || j._id || j.job_id || `${j.title}-${j.company}`),
-    title:       j.title        || j.job_title        || "",
-    company:     j.company      || j.employer_name    || j.organization || "",
-    location:    j.location     || j.job_location     || j.city         || "",
-    type:        j.type         || j.employment_type  || j.job_type     || "",
-    url:         j.url          || j.job_url          || j.apply_url    || j.link || "",
-    description: (j.description || j.job_description  || "").slice(0, 1000),
-    logo:        j.company_logo || j.logo             || "",
-    remote:      !!(j.remote    || j.is_remote        || String(j.location || "").toLowerCase().includes("remote")),
-    source:      j.source       || "",
-    postedAt:    j.date_posted  || j.posted_at        || j.createdAt    || null,
+    externalId:  String(j.id || j._id || `${j.title}-${j.organization}`),
+    title:       j.title             || "",
+    company:     j.organization      || j.company || j.employer_name || "",
+    location:    location,
+    type:        j.employment_type   || j.type || j.job_type || "",
+    url:         j.url               || j.apply_url || j.job_url || j.link || "",
+    description: (j.description      || j.job_description || "").replace(/<[^>]+>/g, "").slice(0, 800),
+    logo:        j.linkedin_org_logo_url || j.company_logo || j.logo || "",
+    remote:      isRemote,
+    source:      j.source            || "LinkedIn",
+    postedAt:    j.date_posted       || j.posted_at || null,
     fetchedAt:   new Date(),
   };
 }
 
-/* ── Try to fetch fresh listings from RapidAPI and upsert into MongoDB ───── */
+/* ── Sync from RapidAPI → upsert into MongoDB ──────────────────────────────── */
 async function syncFromAPI() {
   const response = await fetch("https://internships-api.p.rapidapi.com/active-jb-7d", {
     method: "GET",
@@ -39,22 +57,14 @@ async function syncFromAPI() {
     },
   });
 
-  if (response.status === 429) {
-    throw new Error("RATE_LIMITED");
-  }
+  if (response.status === 429) throw new Error("RATE_LIMITED");
+  if (!response.ok)            throw new Error(`API_ERROR_${response.status}`);
 
-  if (!response.ok) {
-    throw new Error(`API_ERROR_${response.status}`);
-  }
-
-const raw = await response.json();
-console.log("RAW:", JSON.stringify(raw).slice(0, 500)); // ← add
-const list = Array.isArray(raw) ? raw : (raw.data || raw.jobs || []);
-console.log("LIST LENGTH:", list.length); // ← add  const list = Array.isArray(raw) ? raw : (raw.data || raw.jobs || []);
+  const raw  = await response.json();
+  const list = Array.isArray(raw) ? raw : (raw.data || raw.jobs || []);
 
   if (!list.length) return 0;
 
-  // Upsert each listing by externalId — update if exists, insert if new
   const ops = list.map(j => {
     const doc = normalise(j);
     return {
@@ -71,30 +81,23 @@ console.log("LIST LENGTH:", list.length); // ← add  const list = Array.isArray
   return list.length;
 }
 
-/* ── GET /api/internships ────────────────────────────────────────────────────
-   1. If within 6hr window → skip API call, serve straight from MongoDB
-   2. Otherwise → try to sync from API, then serve from MongoDB
-   3. On rate limit / API error → still serve from MongoDB (stale is fine)
-────────────────────────────────────────────────────────────────────────────── */
+/* ── GET /api/internships ──────────────────────────────────────────────────── */
 router.get("/", async (req, res) => {
   const { search = "", type = "", refresh = "" } = req.query;
   const now = Date.now();
 
-  let synced = false;
-  let rateLimited = false;
-  let apiError = null;
-
+  let synced = false, rateLimited = false, apiError = null;
   const shouldFetch = refresh === "1" || now - lastApiFetch > FETCH_INTERVAL;
 
   if (shouldFetch) {
     try {
       const count = await syncFromAPI();
       synced = true;
-      console.log(`Internships synced: ${count} listings saved to MongoDB`);
+      console.log(`Internships synced: ${count} saved to MongoDB`);
     } catch (err) {
       if (err.message === "RATE_LIMITED") {
         rateLimited = true;
-        console.warn("Internships: RapidAPI rate limited — serving from MongoDB");
+        console.warn("Internships: rate limited — serving from MongoDB");
       } else {
         apiError = err.message;
         console.error("Internships API error:", err.message);
@@ -102,15 +105,14 @@ router.get("/", async (req, res) => {
     }
   }
 
-  // Always serve from MongoDB — even if API failed we have stored data
   try {
     const query = {};
 
     if (search?.trim()) {
       query.$or = [
-        { title:    { $regex: search, $options: "i" } },
-        { company:  { $regex: search, $options: "i" } },
-        { location: { $regex: search, $options: "i" } },
+        { title:   { $regex: search, $options: "i" } },
+        { company: { $regex: search, $options: "i" } },
+        { location:{ $regex: search, $options: "i" } },
       ];
     }
 
@@ -123,17 +125,17 @@ router.get("/", async (req, res) => {
     }
 
     const listings = await Internship.find(query)
-      .sort({ fetchedAt: -1, postedAt: -1 })
+      .sort({ postedAt: -1, fetchedAt: -1 })
       .limit(200)
       .lean();
 
     return res.json({
-      data:        listings,
-      total:       listings.length,
+      data:       listings,
+      total:      listings.length,
       synced,
       rateLimited,
       apiError,
-      fetchedAt:   lastApiFetch || null,
+      fetchedAt:  lastApiFetch || null,
     });
 
   } catch (dbErr) {
