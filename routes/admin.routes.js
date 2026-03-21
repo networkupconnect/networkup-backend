@@ -3,10 +3,12 @@ import User from "../models/User.js";
 import Product from "../models/Product.js";
 import Feedback from "../models/Feedback.js";
 import Room from "../models/Room.js";
+import Internship from "../models/Internships.js";
 import { annauth as auth, authorize } from "../middleware/auth.js";
 
 const router = express.Router();
 const isAdmin = [auth, authorize("admin")];
+
 
 // ════════════════════════════════════════
 // 📊 STATS
@@ -22,6 +24,7 @@ router.get("/stats", ...isAdmin, async (req, res) => {
       totalFeedbacks,
       newFeedbacks,
       availableRooms,
+      totalInternships,
     ] = await Promise.all([
       User.countDocuments(),
       Product.countDocuments(),
@@ -31,6 +34,7 @@ router.get("/stats", ...isAdmin, async (req, res) => {
       Feedback.countDocuments(),
       Feedback.countDocuments({ status: "new" }),
       Room.countDocuments({ isAvailable: true }),
+      Internship.countDocuments(),
     ]);
 
     res.json({
@@ -42,6 +46,7 @@ router.get("/stats", ...isAdmin, async (req, res) => {
       totalFeedbacks,
       newFeedbacks,
       availableRooms,
+      totalInternships,
     });
   } catch (err) {
     res.status(500).json({ message: "Failed to fetch stats" });
@@ -58,8 +63,8 @@ router.get("/users", ...isAdmin, async (req, res) => {
     if (role) query.role = role;
     if (search) {
       query.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { email: { $regex: search, $options: "i" } },
+        { name:     { $regex: search, $options: "i" } },
+        { email:    { $regex: search, $options: "i" } },
         { username: { $regex: search, $options: "i" } },
       ];
     }
@@ -169,7 +174,6 @@ router.delete("/products/:id", ...isAdmin, async (req, res) => {
 // 🏠 ROOMS  (Admin full control)
 // ════════════════════════════════════════
 
-// GET all rooms (paginated, searchable, filterable)
 router.get("/rooms", ...isAdmin, async (req, res) => {
   try {
     const { search, type, isAvailable, page = 1, limit = 20 } = req.query;
@@ -178,7 +182,7 @@ router.get("/rooms", ...isAdmin, async (req, res) => {
     if (isAvailable !== undefined) query.isAvailable = isAvailable === "true";
     if (search) {
       query.$or = [
-        { title: { $regex: search, $options: "i" } },
+        { title:    { $regex: search, $options: "i" } },
         { location: { $regex: search, $options: "i" } },
       ];
     }
@@ -197,7 +201,6 @@ router.get("/rooms", ...isAdmin, async (req, res) => {
   }
 });
 
-// POST — Admin creates a room directly (postedBy = admin)
 router.post("/rooms", ...isAdmin, async (req, res) => {
   try {
     const { title, description, type, rent, location, images, facilities, contactName, contactPhone } = req.body;
@@ -206,16 +209,11 @@ router.post("/rooms", ...isAdmin, async (req, res) => {
       return res.status(400).json({ message: "title, type, rent, and location are required" });
 
     const room = await Room.create({
-      title,
-      description,
-      type,
-      rent,
-      location,
+      title, description, type, rent, location,
       images: images || [],
       facilities: facilities || [],
-      contactName,
-      contactPhone,
-      postedBy: req.user._id,   // admin is the poster
+      contactName, contactPhone,
+      postedBy: req.user._id,
       isAvailable: true,
     });
 
@@ -225,7 +223,6 @@ router.post("/rooms", ...isAdmin, async (req, res) => {
   }
 });
 
-// PUT — Admin edits any room
 router.put("/rooms/:id", ...isAdmin, async (req, res) => {
   try {
     const forbidden = ["_id", "__v", "postedBy"];
@@ -244,7 +241,6 @@ router.put("/rooms/:id", ...isAdmin, async (req, res) => {
   }
 });
 
-// DELETE — Admin deletes any room
 router.delete("/rooms/:id", ...isAdmin, async (req, res) => {
   try {
     const room = await Room.findByIdAndDelete(req.params.id);
@@ -255,14 +251,16 @@ router.delete("/rooms/:id", ...isAdmin, async (req, res) => {
   }
 });
 
-// PATCH — Toggle availability quickly
 router.patch("/rooms/:id/availability", ...isAdmin, async (req, res) => {
   try {
     const room = await Room.findById(req.params.id);
     if (!room) return res.status(404).json({ message: "Room not found" });
     room.isAvailable = !room.isAvailable;
     await room.save();
-    res.json({ message: `Room marked as ${room.isAvailable ? "available" : "unavailable"}`, isAvailable: room.isAvailable });
+    res.json({
+      message: `Room marked as ${room.isAvailable ? "available" : "unavailable"}`,
+      isAvailable: room.isAvailable,
+    });
   } catch (err) {
     res.status(500).json({ message: "Failed to toggle availability" });
   }
@@ -272,16 +270,15 @@ router.patch("/rooms/:id/availability", ...isAdmin, async (req, res) => {
 // 📬 FEEDBACK INBOX
 // ════════════════════════════════════════
 
-// GET all feedback (filterable by status/type)
 router.get("/feedback", ...isAdmin, async (req, res) => {
   try {
     const { status, type, search, page = 1, limit = 20 } = req.query;
     const query = {};
     if (status) query.status = status;
-    if (type) query.type = type;
+    if (type)   query.type   = type;
     if (search) {
       query.$or = [
-        { title: { $regex: search, $options: "i" } },
+        { title:       { $regex: search, $options: "i" } },
         { description: { $regex: search, $options: "i" } },
       ];
     }
@@ -301,10 +298,10 @@ router.get("/feedback", ...isAdmin, async (req, res) => {
   }
 });
 
-// GET single feedback
 router.get("/feedback/:id", ...isAdmin, async (req, res) => {
   try {
-    const feedback = await Feedback.findById(req.params.id).populate("userId", "name email profileImage branch year section");
+    const feedback = await Feedback.findById(req.params.id)
+      .populate("userId", "name email profileImage branch year section");
     if (!feedback) return res.status(404).json({ message: "Feedback not found" });
     res.json(feedback);
   } catch (err) {
@@ -312,7 +309,6 @@ router.get("/feedback/:id", ...isAdmin, async (req, res) => {
   }
 });
 
-// PATCH — Update status (in-review / resolved / dismissed)
 router.patch("/feedback/:id/status", ...isAdmin, async (req, res) => {
   try {
     const { status } = req.body;
@@ -333,7 +329,6 @@ router.patch("/feedback/:id/status", ...isAdmin, async (req, res) => {
   }
 });
 
-// DELETE — Admin deletes feedback
 router.delete("/feedback/:id", ...isAdmin, async (req, res) => {
   try {
     const feedback = await Feedback.findByIdAndDelete(req.params.id);
@@ -344,6 +339,83 @@ router.delete("/feedback/:id", ...isAdmin, async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════
+// 💼 INTERNSHIPS
+// ════════════════════════════════════════
+
+// GET all internships — paginated, searchable, filterable by source
+router.get("/internships", ...isAdmin, async (req, res) => {
+  try {
+    const { search, source, page = 1, limit = 20 } = req.query;
+    const query = {};
+    if (source) query.source = source;
+    if (search) {
+      query.$or = [
+        { title:    { $regex: search, $options: "i" } },
+        { company:  { $regex: search, $options: "i" } },
+        { location: { $regex: search, $options: "i" } },
+      ];
+    }
+    const skip = (Number(page) - 1) * Number(limit);
+    const [internships, total] = await Promise.all([
+      Internship.find(query).sort({ fetchedAt: -1 }).skip(skip).limit(Number(limit)).lean(),
+      Internship.countDocuments(query),
+    ]);
+    res.json({ internships, total, page: Number(page), totalPages: Math.ceil(total / Number(limit)) });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to fetch internships" });
+  }
+});
+
+// POST /api/admin/internships/import — bulk upsert from JSON
+router.post("/internships/import", ...isAdmin, async (req, res) => {
+  try {
+    const { jobs } = req.body;
+    if (!Array.isArray(jobs) || !jobs.length)
+      return res.status(400).json({ message: "jobs must be a non-empty array" });
+
+    const ops = jobs.map(doc => ({
+      updateOne: {
+        filter: { externalId: doc.externalId },
+        update: { $set: { ...doc, fetchedAt: new Date() } },
+        upsert: true,
+      },
+    }));
+
+    const result = await Internship.bulkWrite(ops, { ordered: false });
+
+    res.json({
+      inserted: result.upsertedCount,
+      updated:  result.modifiedCount,
+      total:    jobs.length,
+    });
+  } catch (err) {
+    console.error("Internship import error:", err.message);
+    res.status(500).json({ message: "Import failed", detail: err.message });
+  }
+});
+
+// DELETE /api/admin/internships/source/:source — bulk delete all by source
+// NOTE: must be defined BEFORE /:id to avoid route conflict
+router.delete("/internships/source/:source", ...isAdmin, async (req, res) => {
+  try {
+    const result = await Internship.deleteMany({ source: req.params.source });
+    res.json({ message: `Deleted ${result.deletedCount} listings`, deleted: result.deletedCount });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to delete" });
+  }
+});
+
+// DELETE /api/admin/internships/:id — delete single listing
+router.delete("/internships/:id", ...isAdmin, async (req, res) => {
+  try {
+    const item = await Internship.findByIdAndDelete(req.params.id);
+    if (!item) return res.status(404).json({ message: "Not found" });
+    res.json({ message: "Deleted" });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to delete" });
+  }
+});
 
 
 export default router;
