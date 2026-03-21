@@ -43,6 +43,8 @@ function calcSubjectClasses(subject, startDate, endDate, holidays) {
   return count;
 }
 
+
+
 /* ─── Shared aggregate helper ───────────────────────────────────────────────── */
 async function getSubjectAgg(userId, subjectId) {
   const [agg] = await AttendanceRecord.aggregate([

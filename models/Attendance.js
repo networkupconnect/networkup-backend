@@ -1,5 +1,7 @@
 import mongoose from "mongoose";
 
+
+
 // ─── AttendanceSubject ────────────────────────────────────────────────────────
 const attendanceSubjectSchema = new mongoose.Schema(
   {

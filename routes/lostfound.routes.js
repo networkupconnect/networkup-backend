@@ -5,20 +5,43 @@ import upload from "../middleware/upload.js";
 
 const router = express.Router();
 
-router.get("/", async (req, res) => {
+/* ── optional auth middleware ─────────────────────────────────────────────
+   Attaches req.user if a valid token is present, but never rejects the
+   request — so public browsing still works without a token.
+──────────────────────────────────────────────────────────────────────────── */
+const optionalAuth = (req, res, next) => {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith("Bearer ")) return next();
+  // reuse the same protect logic but swallow any auth errors
+  protect(req, res, (err) => next()); // if token invalid, req.user stays undefined
+};
+
+router.get("/", optionalAuth, async (req, res) => {
   try {
     const { type, category, location, mine } = req.query;
     const filter = {};
-    if (mine === "true") filter.postedBy = req.user._id;
-    else if (type) filter.type = type;
+
+    if (mine === "true") {
+      // requires login — return 401 if somehow called without auth
+      if (!req.user) return res.status(401).json({ message: "Login required" });
+      filter.postedBy = req.user._id;
+    } else if (type) {
+      filter.type = type;
+    }
+
     if (category) filter.category = category;
-    if (location) filter.location = location;
+    if (location)  filter.location  = location;
+
     const items = await LostFound.find(filter)
       .sort({ createdAt: -1 })
       .populate("postedBy", "name profileImage")
       .lean();
+
     res.json(items);
-  } catch { res.status(500).json({ message: "Failed" }); }
+  } catch (err) {
+    console.error("GET LOSTFOUND:", err.message);
+    res.status(500).json({ message: "Failed" });
+  }
 });
 
 router.post("/", protect, upload.array("images", 3), async (req, res) => {
