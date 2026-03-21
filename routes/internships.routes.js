@@ -52,6 +52,8 @@ function normaliseRapid(j) {
 }
 
 async function syncRapidAPI() {
+
+    
   if (!process.env.RAPIDAPI_KEY) return 0;
 
   const res = await fetch("https://internships-api.p.rapidapi.com/active-jb-7d?country=IN", {
@@ -105,16 +107,16 @@ function normaliseSerp(j) {
 
 async function syncSerpAPI() {
   if (!process.env.SERP_API_KEY) return 0;
-
+ 
   const queries = [
     "internship India",
     "software intern India",
     "engineering intern India",
     "tech intern Bangalore Mumbai Delhi",
   ];
-
+ 
   let total = 0;
-
+ 
   for (const q of queries) {
     try {
       const params = new URLSearchParams({
@@ -124,27 +126,28 @@ async function syncSerpAPI() {
         gl:        "in",       // country = India
         api_key:   process.env.SERP_API_KEY,
       });
-
+ 
       const res = await fetch(`https://serpapi.com/search?${params}`);
-      if (!res.ok) { console.warn(`SerpAPI ${q}: ${res.status}`); continue; }
-
+      console.log("SerpAPI status:", res.status);
       const data = await res.json();
+      console.log("SerpAPI raw:", JSON.stringify(data).slice(0, 300));
+      if (!res.ok) { console.warn(`SerpAPI ${q}: ${res.status}`); continue; }
       const jobs = data.jobs_results || [];
       if (!jobs.length) continue;
-
+ 
       await upsertMany(jobs.map(normaliseSerp));
       total += jobs.length;
-
+ 
       // Small delay between queries to be polite to the API
       await new Promise(r => setTimeout(r, 300));
     } catch (err) {
       console.warn(`SerpAPI query "${q}" failed:`, err.message);
     }
   }
-
+ 
   return total;
 }
-
+ 
 /* ══════════════════════════════════════════════════════════════════════════════
    SHARED — Upsert helper + sync orchestrator
 ══════════════════════════════════════════════════════════════════════════════ */
