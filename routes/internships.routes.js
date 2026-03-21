@@ -6,154 +6,7 @@ const router = express.Router();
 let lastApiFetch = 0;
 const FETCH_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
 
-/* ── Type prettifier ────────────────────────────────────────────────────────── */
-const TYPE_MAP = {
-  FULL_TIME:"Full-time", FULLTIME:"Full-time",
-  PART_TIME:"Part-time", PARTTIME:"Part-time",
-  INTERN:"Internship", INTERNSHIP:"Internship",
-  CONTRACT:"Contract", CONTRACTOR:"Contract",
-  TEMPORARY:"Temporary",
-};
-function prettifyType(raw) {
-  if (!raw) return "";
-  const arr = Array.isArray(raw) ? raw : [raw];
-  const str = arr.join(", ");
-  return TYPE_MAP[str.toUpperCase().replace(/[- ]/g,"")] || str;
-}
-
-/* ══════════════════════════════════════════════════════════════════════════════
-   SOURCE 1 — RapidAPI Internships
-══════════════════════════════════════════════════════════════════════════════ */
-function normaliseRapid(j) {
-  let location = "";
-  if (j.locations_raw?.length) {
-    const addr = j.locations_raw[0]?.address || {};
-    location = [addr.addressLocality, addr.addressRegion, addr.addressCountry].filter(Boolean).join(", ");
-  }
-  location = location || j.location || "";
-
-  const type     = prettifyType(j.employment_type || j.type || "");
-  const isRemote = !!(j.remote || j.is_remote || location.toLowerCase().includes("remote"));
-
-  return {
-    externalId:  `rapid_${j.id || `${j.title}-${j.organization}`}`,
-    title:       j.title || "",
-    company:     j.organization || j.company || "",
-    location,
-    type,
-    url:         j.url || j.apply_url || "",
-    description: (j.description || "").replace(/<[^>]+>/g, "").slice(0, 800),
-    logo:        j.linkedin_org_logo_url || j.logo || "",
-    remote:      isRemote,
-    source:      "LinkedIn",
-    postedAt:    j.date_posted || null,
-    fetchedAt:   new Date(),
-  };
-}
-
-async function syncRapidAPI() {
-  if (!process.env.RAPIDAPI_KEY) return 0;
-
-  const res = await fetch("https://internships-api.p.rapidapi.com/active-jb-7d?country=IN", {
-    headers: {
-      "x-rapidapi-key":  process.env.RAPIDAPI_KEY,
-      "x-rapidapi-host": "internships-api.p.rapidapi.com",
-      "Content-Type":    "application/json",
-    },
-  });
-
-  if (res.status === 429) { console.warn("RapidAPI: rate limited"); return 0; }
-  if (!res.ok) { console.warn(`RapidAPI: ${res.status}`); return 0; }
-
-  const raw  = await res.json();
-  const list = Array.isArray(raw) ? raw : (raw.data || raw.jobs || []);
-  if (!list.length) return 0;
-
-  await upsertMany(list.map(normaliseRapid));
-  return list.length;
-}
-
-/* ══════════════════════════════════════════════════════════════════════════════
-   SOURCE 2 — SerpAPI Google Jobs (India-focused)
-   Searches multiple queries to get more coverage:
-     "internship India", "software intern India", "engineering intern India"
-══════════════════════════════════════════════════════════════════════════════ */
-function normaliseSerp(j) {
-  const loc = j.location || j.detected_extensions?.location || "";
-  const isRemote = !!(loc.toLowerCase().includes("remote") || j.detected_extensions?.work_from_home);
-
-  // Google Jobs apply link — prefer direct link over Google's redirect
-  const url = j.apply_options?.[0]?.link || j.related_links?.[0]?.link || j.job_link || "";
-
-  return {
-    externalId:  `serp_${j.job_id || `${j.title}-${j.company_name}`}`,
-    title:       j.title        || "",
-    company:     j.company_name || "",
-    location:    loc,
-    type:        j.detected_extensions?.schedule_type || "",
-    url,
-    description: (j.description || "").replace(/<[^>]+>/g, "").slice(0, 800),
-    logo:        j.thumbnail    || "",
-    remote:      isRemote,
-    source:      "Google Jobs",
-    postedAt:    j.detected_extensions?.posted_at
-                   ? new Date(j.detected_extensions.posted_at)
-                   : null,
-    fetchedAt:   new Date(),
-  };
-}
-
-async function syncSerpAPI() {
-  if (!process.env.SERP_API_KEY) return 0;
-
-  const queries = [
-    "internship in India 2025",
-    "software engineering internship Bangalore Hyderabad Pune",
-    "tech internship Delhi Mumbai Chennai India",
-    "MBA internship India",
-    "data science internship India",
-    "marketing internship India",
-  ];
-
-  let total = 0;
-
-  for (const q of queries) {
-    try {
-      const params = new URLSearchParams({
-        engine:  "google_jobs",
-        q,
-        hl:      "en",
-        gl:      "in",
-        api_key: process.env.SERP_API_KEY,
-      });
-
-      const res  = await fetch(`https://serpapi.com/search?${params}`);
-      const data = await res.json();
-
-      if (!res.ok || data.error) {
-        console.warn(`SerpAPI "${q}": ${data.error || res.status}`);
-        continue;
-      }
-
-      const jobs = data.jobs_results || [];
-      console.log(`SerpAPI "${q}": ${jobs.length} jobs`);
-      if (!jobs.length) continue;
-
-      await upsertMany(jobs.map(normaliseSerp));
-      total += jobs.length;
-
-      await new Promise(r => setTimeout(r, 300));
-    } catch (err) {
-      console.warn(`SerpAPI query "${q}" failed:`, err.message);
-    }
-  }
-
-  return total;
-}
-
-/* ══════════════════════════════════════════════════════════════════════════════
-   SHARED — Upsert helper + sync orchestrator
-══════════════════════════════════════════════════════════════════════════════ */
+/* ── Shared upsert ──────────────────────────────────────────────────────────── */
 async function upsertMany(docs) {
   if (!docs.length) return;
   const ops = docs.map(doc => ({
@@ -166,17 +19,255 @@ async function upsertMany(docs) {
   await Internship.bulkWrite(ops, { ordered: false });
 }
 
-async function syncAll() {
-  // Only use SerpAPI (gl=in) — RapidAPI returns global results regardless of country param
-  const serpCount = await syncSerpAPI();
-  console.log(`Internships synced — SerpAPI: ${serpCount}`);
+/* ── Safe fetch helper ──────────────────────────────────────────────────────── */
+async function safeFetch(url, options = {}) {
+  const res = await fetch(url, options);
+  const data = await res.json();
+  return { ok: res.ok, status: res.status, data };
+}
 
-  // Delete old RapidAPI (LinkedIn source) records — they are global, not India
+/* ══════════════════════════════════════════════════════════════════════════════
+   SOURCE 1 — SerpAPI Google Jobs (India, 100 free/month)
+══════════════════════════════════════════════════════════════════════════════ */
+function normaliseSerp(j) {
+  const loc      = j.location || "";
+  const isRemote = !!(loc.toLowerCase().includes("remote") || j.detected_extensions?.work_from_home);
+  const url      = j.apply_options?.[0]?.link || j.job_link || "";
+
+  return {
+    externalId:  `serp_${j.job_id || `${j.title}-${j.company_name}`}`,
+    title:       j.title        || "",
+    company:     j.company_name || "",
+    location:    loc,
+    type:        j.detected_extensions?.schedule_type || "Internship",
+    url,
+    description: (j.description || "").replace(/<[^>]+>/g, "").slice(0, 800),
+    logo:        j.thumbnail || "",
+    remote:      isRemote,
+    source:      "Google Jobs",
+    postedAt:    j.detected_extensions?.posted_at ? new Date(j.detected_extensions.posted_at) : null,
+    fetchedAt:   new Date(),
+  };
+}
+
+async function syncSerpAPI() {
+  if (!process.env.SERP_API_KEY) return 0;
+
+  // Limit to 2 queries to conserve the 100/month free quota
+  const queries = [
+    "internship India 2025",
+    "software engineering internship Bangalore Hyderabad Pune Delhi",
+  ];
+
+  let total = 0;
+  for (const q of queries) {
+    try {
+      const params = new URLSearchParams({ engine:"google_jobs", q, hl:"en", gl:"in", api_key:process.env.SERP_API_KEY });
+      const { ok, data } = await safeFetch(`https://serpapi.com/search.json?${params}`);
+      if (!ok || data.error) { console.warn(`SerpAPI "${q}":`, data.error || "failed"); continue; }
+      const jobs = data.jobs_results || [];
+      console.log(`SerpAPI "${q}": ${jobs.length} jobs`);
+      await upsertMany(jobs.map(normaliseSerp));
+      total += jobs.length;
+      await new Promise(r => setTimeout(r, 400));
+    } catch (err) { console.warn(`SerpAPI "${q}" error:`, err.message); }
+  }
+  return total;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   SOURCE 2 — Himalayas API (Free, no key, India filter)
+   https://himalayas.app/jobs/api/search?q=internship&country=in
+══════════════════════════════════════════════════════════════════════════════ */
+function normaliseHimalayas(j) {
+  const loc      = j.location || j.locationRestrictions?.join(", ") || "Remote";
+  const isRemote = !!(j.remote || loc.toLowerCase().includes("remote"));
+
+  return {
+    externalId:  `him_${j.id || j.slug || `${j.title}-${j.companyName}`}`,
+    title:       j.title       || "",
+    company:     j.companyName || j.company?.name || "",
+    location:    loc,
+    type:        j.jobType     || "Internship",
+    url:         j.applicationLink || j.url || `https://himalayas.app/jobs/${j.slug || ""}`,
+    description: (j.description || j.descriptionHtml || "").replace(/<[^>]+>/g, "").slice(0, 800),
+    logo:        j.companyLogo || j.company?.logo || "",
+    remote:      isRemote,
+    source:      "Himalayas",
+    postedAt:    j.publishedAt ? new Date(j.publishedAt) : null,
+    fetchedAt:   new Date(),
+  };
+}
+
+async function syncHimalayas() {
+  try {
+    const queries = ["developer", "software", "data", "marketing", "design"];
+    let total = 0;
+    for (const q of queries) {
+      const { ok, data } = await safeFetch(
+        `https://himalayas.app/jobs/api/search?country=in&employmentType=Intern&query=${encodeURIComponent(q)}&limit=50`
+      );
+      if (!ok) { console.warn("Himalayas: failed for", q); continue; }
+      const jobs = data.jobs || data.data || [];
+      console.log(`Himalayas "${q}": ${jobs.length} jobs`);
+      await upsertMany(jobs.map(normaliseHimalayas));
+      total += jobs.length;
+      await new Promise(r => setTimeout(r, 300));
+    }
+    return total;
+  } catch (err) { console.warn("Himalayas error:", err.message); return 0; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   SOURCE 3 — Remotive (Free, no key, remote tech/dev jobs)
+   https://remotive.com/api/remote-jobs?category=software-dev
+══════════════════════════════════════════════════════════════════════════════ */
+function normaliseRemotive(j) {
+  const isRemote = true; // Remotive is all-remote
+
+  return {
+    externalId:  `rem_${j.id || `${j.title}-${j.company_name}`}`,
+    title:       j.title        || "",
+    company:     j.company_name || "",
+    location:    j.candidate_required_location || "Worldwide / Remote",
+    type:        j.job_type     || "Full-time",
+    url:         j.url          || "",
+    description: (j.description || "").replace(/<[^>]+>/g, "").slice(0, 800),
+    logo:        j.company_logo || "",
+    remote:      isRemote,
+    source:      "Remotive",
+    postedAt:    j.publication_date ? new Date(j.publication_date) : null,
+    fetchedAt:   new Date(),
+  };
+}
+
+async function syncRemotive() {
+  try {
+    const categories = ["software-dev", "data", "devops-sysadmin", "design", "product"];
+    let total = 0;
+    for (const cat of categories) {
+      const { ok, data } = await safeFetch(
+        `https://remotive.com/api/remote-jobs?category=${cat}&search=intern&limit=50`
+      );
+      if (!ok) { console.warn("Remotive: failed for", cat); continue; }
+      const jobs = data.jobs || [];
+      const filtered = jobs.filter(j => {
+        const loc = (j.candidate_required_location || "").toLowerCase();
+        return !loc || loc.includes("worldwide") || loc.includes("india") ||
+               loc.includes("asia") || loc.includes("apac") || loc.includes("anywhere");
+      });
+      console.log(`Remotive "${cat}": ${filtered.length}/${jobs.length} eligible`);
+      await upsertMany(filtered.map(normaliseRemotive));
+      total += filtered.length;
+      await new Promise(r => setTimeout(r, 300));
+    }
+    return total;
+  } catch (err) { console.warn("Remotive error:", err.message); return 0; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   SOURCE 4 — RemoteOK (Free, no key, remote tech jobs)
+   https://remoteok.com/api
+══════════════════════════════════════════════════════════════════════════════ */
+function normaliseRemoteOK(j) {
+  return {
+    externalId:  `rok_${j.id || j.slug || `${j.position}-${j.company}`}`,
+    title:       j.position    || j.title || "",
+    company:     j.company     || "",
+    location:    j.location    || "Remote / Worldwide",
+    type:        "Remote",
+    url:         j.url         || `https://remoteok.com/remote-jobs/${j.slug || ""}`,
+    description: (j.description || "").replace(/<[^>]+>/g, "").slice(0, 800),
+    logo:        j.logo        || "",
+    remote:      true,
+    source:      "RemoteOK",
+    postedAt:    j.date ? new Date(j.date) : null,
+    fetchedAt:   new Date(),
+  };
+}
+
+async function syncRemoteOK() {
+  try {
+    const { ok, data } = await safeFetch("https://remoteok.com/api?tag=internship", {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; InternshipsBot/1.0)" },
+    });
+    if (!ok) { console.warn("RemoteOK: failed"); return 0; }
+    const jobs = Array.isArray(data) ? data.filter(j => j.id && j.position) : [];
+    console.log(`RemoteOK: ${jobs.length} internship-tagged jobs`);
+    await upsertMany(jobs.map(normaliseRemoteOK));
+    return jobs.length;
+  } catch (err) { console.warn("RemoteOK error:", err.message); return 0; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   SOURCE 5 — Jobicy (Free, no key, India/APAC filter)
+   https://jobicy.com/api/v2/remote-jobs?geo=india
+══════════════════════════════════════════════════════════════════════════════ */
+function normaliseJobicy(j) {
+  const loc      = j.jobGeo || j.jobLevel || "Remote";
+  const isRemote = !!(j.jobType?.toLowerCase().includes("remote") || true);
+
+  return {
+    externalId:  `job_${j.id || `${j.jobTitle}-${j.companyName}`}`,
+    title:       j.jobTitle    || "",
+    company:     j.companyName || "",
+    location:    loc,
+    type:        j.jobType     || "Remote",
+    url:         j.url         || "",
+    description: (j.jobDescription || "").replace(/<[^>]+>/g, "").slice(0, 800),
+    logo:        j.companyLogo || "",
+    remote:      isRemote,
+    source:      "Jobicy",
+    postedAt:    j.pubDate ? new Date(j.pubDate) : null,
+    fetchedAt:   new Date(),
+  };
+}
+
+async function syncJobicy() {
+  try {
+    const endpoints = [
+      "https://jobicy.com/api/v2/remote-jobs?geo=india&industry=dev&count=50",
+      "https://jobicy.com/api/v2/remote-jobs?geo=apac&industry=dev&count=50",
+      "https://jobicy.com/api/v2/remote-jobs?geo=india&industry=design&count=50",
+      "https://jobicy.com/api/v2/remote-jobs?geo=apac&industry=marketing&count=50",
+    ];
+    let total = 0;
+    for (const url of endpoints) {
+      const { ok, data } = await safeFetch(url);
+      if (!ok) { console.warn("Jobicy: failed for", url); continue; }
+      const jobs = data.jobs || [];
+      console.log(`Jobicy (${url.split("geo=")[1]?.split("&")[0]}): ${jobs.length} jobs`);
+      await upsertMany(jobs.map(normaliseJobicy));
+      total += jobs.length;
+      await new Promise(r => setTimeout(r, 300));
+    }
+    return total;
+  } catch (err) { console.warn("Jobicy error:", err.message); return 0; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   SYNC ALL SOURCES
+══════════════════════════════════════════════════════════════════════════════ */
+async function syncAll() {
+  // Delete old global LinkedIn/RapidAPI records
   await Internship.deleteMany({ source: { $in: ["LinkedIn", "linkedin"] } });
-  console.log("Cleaned up global LinkedIn listings from MongoDB");
+
+  // Run all free sources in parallel, SerpAPI sequentially (rate limit)
+  const [himCount, remCount, rokCount, jobCount] = await Promise.all([
+    syncHimalayas(),
+    syncRemotive(),
+    syncRemoteOK(),
+    syncJobicy(),
+  ]);
+
+  // SerpAPI last (sequential queries internally)
+  const serpCount = await syncSerpAPI();
+
+  const total = himCount + remCount + rokCount + jobCount + serpCount;
+  console.log(`Internships synced — Himalayas:${himCount} Remotive:${remCount} RemoteOK:${rokCount} Jobicy:${jobCount} SerpAPI:${serpCount} | Total:${total}`);
 
   lastApiFetch = Date.now();
-  return serpCount;
+  return total;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
@@ -190,22 +281,14 @@ router.get("/", async (req, res) => {
   const shouldFetch = refresh === "1" || now - lastApiFetch > FETCH_INTERVAL;
 
   if (shouldFetch) {
-    try {
-      await syncAll();
-      synced = true;
-    } catch (err) {
-      apiError = err.message;
-      console.error("Internships syncAll error:", err.message);
-    }
+    try { await syncAll(); synced = true; }
+    catch (err) { apiError = err.message; console.error("syncAll error:", err.message); }
   }
 
   try {
-    // Show India listings only — SerpAPI (gl=in) + India city names from RapidAPI
+    // Serve all sources except old LinkedIn/global ones
     const query = {
-      $or: [
-        { source: "Google Jobs" },
-        { location: { $regex: "india|mumbai|delhi|bangalore|bengaluru|hyderabad|pune|chennai|kolkata|noida|gurgaon|gurugram|ahmedabad|jaipur|surat|kochi|remote", $options: "i" } },
-      ],
+      source: { $nin: ["LinkedIn", "linkedin"] },
     };
 
     if (search?.trim()) {
@@ -227,12 +310,11 @@ router.get("/", async (req, res) => {
     }
 
     const listings = await Internship.find(query)
-      .sort({ fetchedAt: -1 })
+      .sort({ postedAt: -1, fetchedAt: -1 })
       .limit(300)
       .lean();
 
-    console.log("DB total records:", await Internship.countDocuments({}));
-    console.log("DB query matches:", listings.length);
+    console.log(`Serving ${listings.length} internships`);
 
     return res.json({
       data:      listings,
@@ -243,7 +325,7 @@ router.get("/", async (req, res) => {
     });
 
   } catch (dbErr) {
-    console.error("Internships DB error:", dbErr.message);
+    console.error("DB error:", dbErr.message);
     return res.status(500).json({ message: "Failed to load internships" });
   }
 });
