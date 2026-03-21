@@ -1,6 +1,5 @@
 import express from "express";
 import Internship from "../models/Internships.js";
-import { getJson } from "serpapi";
 
 const router = express.Router();
 
@@ -118,18 +117,21 @@ async function syncSerpAPI() {
 
   for (const q of queries) {
     try {
-      const data = await new Promise((resolve, reject) => {
-        getJson({
-          engine:  "google_jobs",
-          q,
-          hl:      "en",
-          gl:      "in",
-          api_key: process.env.SERP_API_KEY,
-        }, (json) => {
-          if (json.error) reject(new Error(json.error));
-          else resolve(json);
-        });
+      const params = new URLSearchParams({
+        engine:  "google_jobs",
+        q,
+        hl:      "en",
+        gl:      "in",
+        api_key: process.env.SERP_API_KEY,
       });
+
+      const res  = await fetch(`https://serpapi.com/search?${params}`);
+      const data = await res.json();
+
+      if (!res.ok || data.error) {
+        console.warn(`SerpAPI "${q}": ${data.error || res.status}`);
+        continue;
+      }
 
       const jobs = data.jobs_results || [];
       console.log(`SerpAPI "${q}": ${jobs.length} jobs`);
