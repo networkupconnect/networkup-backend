@@ -107,10 +107,12 @@ async function syncSerpAPI() {
   if (!process.env.SERP_API_KEY) return 0;
 
   const queries = [
-    "internship India",
-    "software intern India",
-    "engineering intern India",
-    "tech intern Bangalore Mumbai Delhi",
+    "internship in India 2025",
+    "software engineering internship Bangalore Hyderabad Pune",
+    "tech internship Delhi Mumbai Chennai India",
+    "MBA internship India",
+    "data science internship India",
+    "marketing internship India",
   ];
 
   let total = 0;
@@ -165,12 +167,16 @@ async function upsertMany(docs) {
 }
 
 async function syncAll() {
-  const [r, s] = await Promise.allSettled([syncRapidAPI(), syncSerpAPI()]);
-  const rapidCount = r.status === "fulfilled" ? r.value : 0;
-  const serpCount  = s.status === "fulfilled" ? s.value : 0;
-  console.log(`Internships synced — RapidAPI: ${rapidCount}, SerpAPI: ${serpCount}`);
+  // Only use SerpAPI (gl=in) — RapidAPI returns global results regardless of country param
+  const serpCount = await syncSerpAPI();
+  console.log(`Internships synced — SerpAPI: ${serpCount}`);
+
+  // Delete old RapidAPI (LinkedIn source) records — they are global, not India
+  await Internship.deleteMany({ source: { $in: ["LinkedIn", "linkedin"] } });
+  console.log("Cleaned up global LinkedIn listings from MongoDB");
+
   lastApiFetch = Date.now();
-  return rapidCount + serpCount;
+  return serpCount;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
@@ -194,10 +200,13 @@ router.get("/", async (req, res) => {
   }
 
   try {
-    // Base filter — prefer India listings, but show all if few results
-    const indiaRegex = "india|mumbai|delhi|bangalore|bengaluru|hyderabad|pune|chennai|kolkata|noida|gurgaon|gurugram|ahmedabad|jaipur|surat|kochi|remote";
-
-    const query = {};
+    // Show India listings only — SerpAPI (gl=in) + India city names from RapidAPI
+    const query = {
+      $or: [
+        { source: "Google Jobs" },
+        { location: { $regex: "india|mumbai|delhi|bangalore|bengaluru|hyderabad|pune|chennai|kolkata|noida|gurgaon|gurugram|ahmedabad|jaipur|surat|kochi|remote", $options: "i" } },
+      ],
+    };
 
     if (search?.trim()) {
       query.$and = [{
