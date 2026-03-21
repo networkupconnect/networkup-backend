@@ -1,26 +1,17 @@
 import express from "express";
 import Resource from "../models/Resource.js";
 import { annauth as protect } from "../middleware/auth.js";
-import upload from "../middleware/upload.js";
 
 const router = express.Router();
 
-router.get("/my", protect, async (req, res) => {
+/* ── GET /api/resources/all ─────────────────────────────────────────────────
+   Public — no auth required. Filter by type if provided.
+   Must be defined BEFORE /:id routes.
+────────────────────────────────────────────────────────────────────────────── */
+router.get("/all", async (req, res) => {
   try {
-    const { branch, year, section } = req.user;
-    const { type } = req.query;
-
-    if (!branch || !year) {
-      return res.status(400).json({ message: "Please complete your profile with branch and year" });
-    }
-
-    const filter = {
-      branch,
-      year,
-      $or: [{ section: "all" }, { section: section || "all" }],
-    };
-
-    if (type) filter.type = type;
+    const filter = {};
+    if (req.query.type) filter.type = req.query.type;
 
     const resources = await Resource.find(filter)
       .sort({ createdAt: -1 })
@@ -29,49 +20,59 @@ router.get("/my", protect, async (req, res) => {
 
     res.json(resources);
   } catch (err) {
-    console.error(err);
+    console.error("GET /resources/all:", err.message);
     res.status(500).json({ message: "Failed to fetch resources" });
   }
 });
 
-router.post("/", protect, upload.single("file"), async (req, res) => {
+/* ── POST /api/resources ────────────────────────────────────────────────────
+   No file upload — stores links only.
+────────────────────────────────────────────────────────────────────────────── */
+router.post("/", protect, async (req, res) => {
   try {
-    // ✅ Added `unit` to destructuring
-    const { title, description, type, branch, year, section, subject, unit } = req.body;
+    const { title, description, type, subject, unit, lectureLink, notesLink } = req.body;
 
-    if (!title || !type || !branch || !year || !subject) {
-      return res.status(400).json({ message: "All fields are required" });
-    }
-
-    if (!req.file) {
-      return res.status(400).json({ message: "Please upload a file" });
-    }
+    if (!title?.trim())   return res.status(400).json({ message: "Title is required" });
+    if (!type)            return res.status(400).json({ message: "Type is required" });
+    if (!subject?.trim()) return res.status(400).json({ message: "Subject is required" });
+    if (!lectureLink?.trim() && !notesLink?.trim())
+      return res.status(400).json({ message: "At least one link is required" });
 
     const resource = await Resource.create({
-      title,
-      description,
+      title:       title.trim(),
+      description: (description || "").trim(),
       type,
-      branch,
-      year: Number(year),
-      section: section || "all",
-      subject,
-      unit: unit || "General", // ✅ Added unit field
-      fileUrl: req.file.path,
-      uploadedBy: req.user._id,
+      subject:     subject.trim(),
+      unit:        (unit || "General").trim(),
+      lectureLink: (lectureLink || "").trim(),
+      notesLink:   (notesLink   || "").trim(),
+      uploadedBy:  req.user._id,
     });
 
     res.status(201).json(resource);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Failed to upload resource" });
+    console.error("POST /resources:", err.message);
+    res.status(500).json({ message: "Failed to save resource" });
   }
 });
 
+/* ── DELETE /api/resources/:id ──────────────────────────────────────────── */
 router.delete("/:id", protect, async (req, res) => {
   try {
+    const resource = await Resource.findById(req.params.id);
+    if (!resource) return res.status(404).json({ message: "Not found" });
+
+    if (
+      resource.uploadedBy?.toString() !== req.user._id.toString() &&
+      req.user.role !== "admin"
+    ) {
+      return res.status(403).json({ message: "Not authorized" });
+    }
+
     await Resource.findByIdAndDelete(req.params.id);
-    res.json({ message: "Deleted successfully" });
+    res.json({ message: "Deleted" });
   } catch (err) {
+    console.error("DELETE /resources/:id:", err.message);
     res.status(500).json({ message: "Failed to delete" });
   }
 });
